@@ -5,18 +5,17 @@ extern crate tokio_core as core;
 extern crate futures;
 extern crate futures_cpupool as cpupool;
 
-use std::net::SocketAddr;
-use std::io::Read;
-use std::convert::From;
+use std::io;
+use std::convert::{From, Into};
 use std::num::ParseFloatError;
 use std::time;
 
+#[allow(unused_imports)]
 use cpupool::CpuPool;
-use futures::{Future, Poll, Async};
+use futures::{Future, IntoFuture, Poll, Async};
 use futures::stream::Stream;
 
 use core::net::UdpSocket;
-use core::io::Io;
 
 #[test]
 fn it_works() {
@@ -45,10 +44,10 @@ impl PointType {
 }
 
 pub struct Point {
-    metric: String,
-    tags: Vec<String>,
-    at: u64,
-    ptype: PointType,
+    pub metric: String,
+    pub tags: Vec<String>,
+    pub at: u64,
+    pub ptype: PointType,
 }
 
 
@@ -96,16 +95,16 @@ struct LineBuf {
 const CLCR: u8 = '\n' as u8;
 
 impl LineBuf {
-    fn merge_product(&mut self, input: &[u8]) {
+    fn merge(&mut self, input: &[u8]) {
         self.buf.extend_from_slice(input);
     }
 }
 
-impl Stream for LineBuf {
+impl Future for LineBuf {
     type Item = Point;
     type Error = LinError;
 
-    fn poll(&mut self) -> Poll<Option<Self::Item>, LinError> {
+    fn poll(&mut self) -> Poll<Self::Item, LinError> {
         let cr_pos = match self.buf.iter().position(|sbyte| &CLCR == sbyte) {
             Some(pos) => pos,
             None => return Ok(Async::NotReady),
@@ -114,7 +113,7 @@ impl Stream for LineBuf {
         let line: Vec<_> = self.buf.drain(0..(cr_pos + 1)).collect();
 
         match Point::from_bytes(line) {
-            Ok(pt) => Ok(Async::Ready(Some(pt))),
+            Ok(pt) => Ok(Async::Ready(pt)),
             Err(err) => {
                 warn!("wrong line meet,error: {:?}", err);
                 Ok(Async::NotReady)
@@ -126,19 +125,43 @@ impl Stream for LineBuf {
 
 pub struct Collector {
     sock: UdpSocket,
-    addr: SocketAddr,
+    local: [u8; 8 * 1024],
+    buf: LineBuf,
 }
 
+impl Collector {
+    pub fn new() {
+        // TODO: Impl it
+    }
+}
+
+
 impl Stream for Collector {
-    type Item = (Vec<u8>);
+    type Item = Point;
     type Error = LinError;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
         if let Async::NotReady = self.sock.poll_read() {
             return Ok(Async::NotReady);
         }
+        let feedback =
+            self.sock.recv_from(&mut self.local[..]).map_err(Into::<LinError>::into).into_future();
 
-        Ok(Async::NotReady)
+        feedback.map(|(size, remote)| {
+                debug!("recv from {}", remote);
+                // NotReady if the packet not end with CLCR
+                if self.local[size - 1] != CLCR {
+                    return Ok(Async::NotReady);
+                }
+                self.buf.merge(&self.local[..size]);
+                self.buf.poll()
+            })
+            .flatten()
+            .map(|item| match item {
+                Async::Ready(t) => Some(t),
+                Async::NotReady => None,
+            })
+            .poll()
     }
 }
 
@@ -147,11 +170,18 @@ pub enum LinError {
     None,
     WrongLine,
     ParseValueError(ParseFloatError),
+    IoError(io::Error),
 }
 
 impl From<ParseFloatError> for LinError {
     fn from(oe: ParseFloatError) -> LinError {
         LinError::ParseValueError(oe)
+    }
+}
+
+impl From<io::Error> for LinError {
+    fn from(oe: io::Error) -> LinError {
+        LinError::IoError(oe)
     }
 }
 // TODO: Impl it
