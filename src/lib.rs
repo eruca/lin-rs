@@ -1,3 +1,4 @@
+#![feature(test)]
 #![feature(proc_macro)]
 #[macro_use]
 extern crate serde_derive;
@@ -6,47 +7,64 @@ extern crate log;
 
 extern crate crossbeam;
 extern crate env_logger;
+
 extern crate futures;
-extern crate futures_cpupool as cpupool;
+extern crate futures_cpupool as pool;
 extern crate hyper;
 extern crate num_cpus;
 extern crate serde;
 extern crate serde_json;
+extern crate test;
 extern crate tokio_core as core;
-
-pub mod net;
+extern crate fnv;
+extern crate net2;
 
 use std::io;
 use std::num::ParseFloatError;
 use std::convert::{From, Into};
 use std::collections::{BTreeSet, HashMap};
+use std::hash::Hasher;
+use std::io::ErrorKind;
 use std::sync::{Mutex, Arc};
 use std::thread;
 use std::mem;
+use std::default::Default;
 use std::net::SocketAddr;
 
-use cpupool::CpuPool;
 use core::net::UdpSocket;
 use core::reactor::{Core, Handle};
 use crossbeam::sync::MsQueue;
+use fnv::FnvHasher;
 use futures::{Future, IntoFuture, Poll, Async};
 use futures::stream::Stream;
+use net2::UdpBuilder;
+use net2::unix::UnixUdpBuilderExt;
 use serde::ser::{Serialize, Serializer};
 
-
-
+#[derive(Debug)]
 pub struct Collector {
     socket: UdpSocket,
-    local: [u8; 8 * 1024],
+    local: Vec<u8>,
 }
 
 impl Collector {
     pub fn bind(addr: &str, handle: &Handle) -> Collector {
         let addr = addr.parse::<SocketAddr>().unwrap();
-        let socket = UdpSocket::bind(&addr, handle).unwrap();
+        let builder = UdpBuilder::new_v4().expect("UdpBuilder not initial");
+        let std_socket = builder.reuse_address(true)
+            .expect("REUSE_ADDRESS not support in this os")
+            .reuse_port(true)
+            .expect("REUSE_PORT not support in this os")
+            .bind(addr)
+            .expect("Bind Error");
+        let socket = UdpSocket::from_socket(std_socket, handle).unwrap();
+        // let socket = UdpSocket::bind(&addr, handle).unwrap();
+        let mut vec = Vec::new();
+        // vec.resize(8, 0);
+        vec.resize(8 * 1024 * 1024, 0);
         Collector {
             socket: socket,
-            local: [0u8; 8 * 1024],
+            local: vec,
         }
     }
 }
@@ -56,10 +74,21 @@ impl Stream for Collector {
     type Error = LinError;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        self.socket
-            .recv_from(&mut self.local)
-            .map_err(Into::<LinError>::into)
-            .into_future()
+        if let Async::NotReady = self.socket.poll_read() {
+            return Ok(Async::NotReady);
+        }
+
+        let inner = match self.socket.recv_from(&mut self.local) {
+            Ok(inner) => Ok(inner),
+            Err(err) => {
+                if err.kind() == ErrorKind::WouldBlock {
+                    return Ok(Async::NotReady);
+                }
+                Err(err)
+            }
+        };
+        inner.into_future()
+            .map_err(|err| Into::<LinError>::into(err))
             .map(|(size, remote)| {
                 debug!("receive {} byte from {}", size, remote);
                 Some(Vec::from(&self.local[..size]))
@@ -68,23 +97,47 @@ impl Stream for Collector {
     }
 }
 
-pub struct Converter<I>
-    where I: Stream<Item = Vec<u8>, Error = LinError>
-{
-    collector: I,
+pub struct Converter {
+    local: Vec<u8>,
 }
 
-impl<I> Stream for Converter<I>
-    where I: Stream<Item = Vec<u8>, Error = LinError>
-{
-    type Item = Vec<u8>;
+impl Stream for Converter {
+    type Item = Proto;
     type Error = LinError;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        // TODO: impl it
-        Ok(Async::NotReady)
+        if self.local.len() == 0 {
+            // poll from stream
+            return Ok(Async::Ready(None));
+        }
+        let first = match self.local.iter().position(|x| x == &CLCR) {
+            Some(pos) => pos,
+            None => {
+                warn!("wrong line meet at {}",
+                      String::from_utf8_lossy(&self.local));
+                self.local.clear();
+                return Ok(Async::NotReady);
+            }
+        };
+
+        if first == 0 {
+            return Ok(Async::NotReady);
+        }
+
+        let drained = self.local.drain(..first + 1);
+        let line: Vec<_> = drained.into_iter().collect();
+        let line_len = line.len();
+        let proto = match Proto::from_raw(&line[..line_len - 1]) {
+            Ok(proto) => proto,
+            Err(err) => {
+                warn!("wrong line meet, and parse error :{:?}", err);
+                return Ok(Async::NotReady);
+            }
+        };
+        Ok(Async::Ready(Some(proto)))
     }
 }
+
 
 #[derive(PartialEq, Eq, Hash, Copy,Clone)]
 pub enum ProtoType {
@@ -93,7 +146,7 @@ pub enum ProtoType {
     Gauge,
 }
 
-pub use ProtoType::{Count, Time, Gauge};
+pub use self::ProtoType::{Count, Time, Gauge};
 
 impl ProtoType {
     fn from_raw(c: char) -> Result<ProtoType> {
@@ -228,20 +281,18 @@ impl Serialize for Entry {
         // 2. tags
         s.serialize_map_key(&mut state, "tags")?;
         // tags values;
-        {
-            let len = self.index.tags.len();
-            let mut tag_state = s.serialize_map(Some(len))?;
-            for kv in &self.index.tags {
-                let ksp: Vec<_> = kv.splitn(2, "=").collect();
-                if ksp.len() != 2 {
-                    continue;
-                }
-
-                s.serialize_map_key(&mut tag_state, ksp[0])?;
-                s.serialize_map_value(&mut tag_state, ksp[1])?;
+        let len = self.index.tags.len();
+        let mut tag_state = s.serialize_map(Some(len))?;
+        for kv in &self.index.tags {
+            let ksp: Vec<_> = kv.splitn(2, "=").collect();
+            if ksp.len() != 2 {
+                continue;
             }
-            s.serialize_map_end(tag_state)?;
+
+            s.serialize_map_key(&mut tag_state, ksp[0])?;
+            s.serialize_map_value(&mut tag_state, ksp[1])?;
         }
+        s.serialize_map_end(tag_state)?;
 
         // 3. time
         s.serialize_map_key(&mut state, "timestamp")?;
@@ -253,6 +304,54 @@ impl Serialize for Entry {
 
         s.serialize_map_end(state)
     }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::{encode, product};
+    use test::Bencher;
+
+    #[bench]
+    fn bench_encode(b: &mut Bencher) {
+        let entry = product();
+        let mut len = 0usize;
+        let mut count = 0usize;
+        b.iter(|| for _ in 0..10000 {
+            len += encode(&entry);
+            count += 1;
+        });
+        let len = len as f64 / 1024.0 / 1024.0;
+        let _avg = len / (count as f64);
+        // println!("len is :{}, count: {}, avg: {} ",
+        //          len ,
+        //          count,
+        //          avg,
+        // );
+    }
+}
+
+pub fn product() -> Entry {
+    let mut tags = BTreeSet::new();
+    tags.insert("from=localhost".to_owned());
+    tags.insert("service=lin.rs".to_owned());
+    tags.insert("iface=encode".to_owned());
+    let idx = Index::build("helloWorld".to_string(), tags, 'c').unwrap();
+    let vecs = vec![
+        Point{kind: "SUM", value: 50000.0},
+        Point{kind: "COUNT", value:11.0},
+        Point{kind: "MAX", value:2013.0},
+        Point{kind: "MIN", value:10.0},];
+    let now = com::now();
+    Entry {
+        index: idx,
+        points: vecs,
+        time: now,
+    }
+}
+
+pub fn encode(entry: &Entry) -> usize {
+    let encoded = serde_json::to_string(&entry).unwrap();
+    encoded.len()
 }
 
 
@@ -288,6 +387,12 @@ pub trait Push {
 
 pub struct TimeSet {
     inmap: HashMap<Index, Vec<f64>>,
+}
+
+impl Default for TimeSet {
+    fn default() -> Self {
+        TimeSet { inmap: HashMap::new() }
+    }
 }
 
 
@@ -359,6 +464,12 @@ pub struct GaugeSet {
     inmap: HashMap<Index, f64>,
 }
 
+impl Default for GaugeSet {
+    fn default() -> Self {
+        GaugeSet { inmap: HashMap::new() }
+    }
+}
+
 impl Push for GaugeSet {
     fn push(&mut self, proto: Proto) {
         let value = proto.value;
@@ -391,6 +502,12 @@ impl IntoEntries for GaugeSet {
 
 pub struct CountSet {
     inmap: HashMap<Index, (f64, u64)>,
+}
+
+impl Default for CountSet {
+    fn default() -> Self {
+        CountSet { inmap: HashMap::new() }
+    }
 }
 
 impl IntoEntries for CountSet {
@@ -433,6 +550,15 @@ pub struct MetricSet {
 }
 
 impl MetricSet {
+    fn new(queue: Arc<MsQueue<Proto>>) -> MetricSet {
+        MetricSet {
+            time: Arc::new(Mutex::new(TimeSet::default())),
+            gauge: Arc::new(Mutex::new(GaugeSet::default())),
+            count: Arc::new(Mutex::new(CountSet::default())),
+            queue: queue,
+        }
+    }
+
     fn poll_run(&self) -> thread::JoinHandle<()> {
         let queue = self.queue.clone();
         let time = self.time.clone();
@@ -500,7 +626,8 @@ impl Future for MetricSet {
             if entries.len() == 0 {
                 continue;
             }
-
+            info!("Flush ticked");
+            // TODO: impl it
             // json and send back to remote
         }
 
@@ -531,15 +658,74 @@ impl Push for MetricSet {
     }
 }
 
-pub fn run() {
+const BIT_SHIELD: usize = 0x7;
+const WORKER_THREAD: usize = 8;
+
+#[derive(Clone)]
+pub struct HashRing {
+    ring: Vec<Arc<MsQueue<Proto>>>,
+}
+
+impl HashRing {
+    pub fn dispatch(&self, proto: Proto) {
+        let mut hasher = FnvHasher::default();
+        hasher.write(proto.index.metric.as_bytes());
+        let hash_val = hasher.finish();
+        let pos = hash_val as usize & BIT_SHIELD;
+        self.ring[pos].push(proto);
+    }
+
+    pub fn ring_queues(&self) -> &[Arc<MsQueue<Proto>>] {
+        &self.ring
+    }
+}
+
+impl Default for HashRing {
+    fn default() -> Self {
+        let vecs: Vec<_> = (0..WORKER_THREAD)
+            .into_iter()
+            .map(|_| Arc::new(MsQueue::new()))
+            .collect();
+        HashRing { ring: vecs }
+    }
+}
+
+
+unsafe impl Sync for HashRing {}
+
+pub fn run(bind: &str) {
+    env_logger::init().unwrap();
+    let ring = Arc::new(HashRing::default());
+    let consumers: Vec<_> = ring.ring_queues()
+        .iter()
+        .map(|queue| {
+            let queue = queue.clone();
+            thread::spawn(move || {
+                let mut set = MetricSet::new(queue);
+                set.poll().unwrap()
+            })
+        })
+        .collect();
+
+    info!("start to produce");
+    run_producer(bind, ring.clone());
+    for con in consumers.into_iter() {
+        con.join().unwrap();
+    }
+}
+
+fn run_producer(bind: &str, ring: Arc<HashRing>) {
     let mut core = Core::new().unwrap();
+    // let count = com::max(num_cpus::get() / 4, 1);
     let handle = core.handle();
-    let collector = Collector::bind(":8179", &handle);
-    let converter = Converter { collector: collector };
-    let serve = converter.for_each(|proto| Ok(()));
-    let cpu_count = num_cpus::get();
-    let pool = CpuPool::new(com::max(cpu_count / 2, 1));
-    let service = pool.spawn(serve);
+    let collecter = Collector::bind(bind, &handle);
+    let service = collecter.map(|packet| Converter { local: packet })
+        .flatten()
+        .for_each(|proto| {
+            info!("produce a proto");
+            ring.dispatch(proto);
+            Ok(())
+        });
     core.run(service).unwrap();
 }
 
@@ -567,6 +753,7 @@ impl From<io::Error> for LinError {
         LinError::IoError(oe)
     }
 }
+
 
 pub mod com {
     use std::time;

@@ -1,5 +1,5 @@
 extern crate lin;
 
 fn main() {
-    println!("Hello, world!");
+    lin::run("127.0.0.1:8188");
 }

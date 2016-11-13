@@ -23,3 +23,5 @@ serde = "0.8"
 serde_derive = "0.8"
 serde_json = "0.8"  # just for the example, not required in general
 hyper = "0.9.12"
+fnv = "1.0.5"
+net2 = "0.2.26"
