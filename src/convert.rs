@@ -5,6 +5,7 @@ use futures::stream::Stream;
 
 use ::{LinError, Result};
 
+/// Converter Construct with a full UDP packet, and convert it self into a stream
 pub struct Converter {
     local: Vec<u8>,
 }
@@ -24,6 +25,7 @@ impl Stream for Converter {
             // poll from stream
             return Ok(Async::Ready(None));
         }
+
         let first = match self.local.iter().position(|x| x == &CLCR) {
             Some(pos) => pos,
             None => {
@@ -53,6 +55,7 @@ impl Stream for Converter {
 }
 
 
+/// ProtoType was each proto type which represent with 'c'|'t'|'g' .
 #[derive(PartialEq, Eq, Hash, Copy,Clone)]
 #[derive(Debug)]
 pub enum ProtoType {
@@ -74,6 +77,7 @@ impl ProtoType {
     }
 }
 
+/// Index was a type for HashMap key to store in memory
 #[derive(Debug, Hash, Clone, Eq, PartialEq,)]
 pub struct Index {
     pub metric: String,
@@ -100,10 +104,14 @@ pub struct Proto {
 pub const CLCR: u8 = '\n' as u8;
 pub const VLINE: u8 = '|' as u8;
 pub const SPACE: u8 = ' ' as u8;
+pub const EQUAL: u8 = '=' as u8;
 
 impl Proto {
+    /// trim and split metric and tags
     fn split_tags(input: &[u8]) -> Result<(String, BTreeSet<String>)> {
-        let mut lsp = input.split(|x| x == &SPACE).filter(|bytes| bytes.len() != 0);
+        // filter to remove zero length instance
+        let mut lsp = input.split(|x| x == &SPACE)
+            .filter(|bytes| bytes.len() != 0 && bytes.contains(&EQUAL));
 
         let metric = lsp.next()
             .map(|bytes| {
@@ -120,6 +128,7 @@ impl Proto {
         Ok((metric, tags))
     }
 
+    /// parse each line into Proto
     pub fn from_raw(line: &[u8]) -> Result<Proto> {
         if line.len() == 0 {
             return Err(LinError::WrongLine);

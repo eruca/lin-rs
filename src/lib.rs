@@ -44,10 +44,13 @@ pub use lin::{Point, Entry};
 pub use memset::MetricSet;
 pub use hash::HashRing;
 
+/// Start a new bind at `bind` upd socket and read socket.
+/// And send serialized byte code json request to `remote` url
 pub fn run(bind: &str, remote: &str) {
     env_logger::init().unwrap();
     let ring = Arc::new(HashRing::default());
     let remote = remote.to_string();
+    // start comsumer and serializer threads
     let consumers: Vec<_> = ring.ring_queues()
         .iter()
         .map(|queue| {
@@ -60,6 +63,7 @@ pub fn run(bind: &str, remote: &str) {
         })
         .collect();
 
+    // start producer and collector threads
     let count = com::max(num_cpus::get() / 4, 1);
     info!("start {} produce thread", count);
     let producer: Vec<_> = (0..count)
@@ -79,6 +83,7 @@ pub fn run(bind: &str, remote: &str) {
     }
 }
 
+/// start a new collector thread to accept udp proto line packet
 fn run_producer(bind: &str, ring: Arc<HashRing>) {
     let mut core = Core::new().unwrap();
     let handle = core.handle();
@@ -92,8 +97,8 @@ fn run_producer(bind: &str, ring: Arc<HashRing>) {
     core.run(service).unwrap();
 }
 
-
 type Result<T> = ::std::result::Result<T, LinError>;
+
 #[derive(Debug)]
 pub enum LinError {
     None,

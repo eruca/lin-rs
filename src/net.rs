@@ -11,6 +11,8 @@ use net2::unix::UnixUdpBuilderExt;
 
 use self::super::LinError;
 
+const MAX_LINE_LEN: usize = 8 * 1024 * 1024;
+
 #[derive(Debug)]
 pub struct Collector {
     socket: UdpSocket,
@@ -28,10 +30,8 @@ impl Collector {
             .bind(addr)
             .expect("Bind Error");
         let socket = UdpSocket::from_socket(std_socket, handle).unwrap();
-        // let socket = UdpSocket::bind(&addr, handle).unwrap();
         let mut vec = Vec::new();
-        // vec.resize(8, 0);
-        vec.resize(8 * 1024 * 1024, 0);
+        vec.resize(MAX_LINE_LEN, 0);
         Collector {
             socket: socket,
             local: vec,
@@ -49,14 +49,15 @@ impl Stream for Collector {
         }
 
         let inner = match self.socket.recv_from(&mut self.local) {
-            Ok(inner) => Ok(inner),
             Err(err) => {
                 if err.kind() == ErrorKind::WouldBlock {
                     return Ok(Async::NotReady);
                 }
                 Err(err)
             }
+            inner => inner,
         };
+
         inner.into_future()
             .map_err(|err| Into::<LinError>::into(err))
             .map(|(size, remote)| {
