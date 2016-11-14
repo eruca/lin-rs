@@ -10,6 +10,7 @@ extern crate env_logger;
 
 extern crate futures;
 extern crate futures_cpupool as pool;
+#[macro_use]
 extern crate hyper;
 extern crate num_cpus;
 extern crate serde;
@@ -24,7 +25,7 @@ use std::num::ParseFloatError;
 use std::convert::{From, Into};
 use std::collections::{BTreeSet, HashMap};
 use std::hash::Hasher;
-use std::io::ErrorKind;
+use std::io::{Read, ErrorKind};
 use std::sync::{Mutex, Arc};
 use std::thread;
 use std::mem;
@@ -36,7 +37,10 @@ use core::reactor::{Core, Handle};
 use crossbeam::sync::MsQueue;
 use fnv::FnvHasher;
 use futures::{Future, IntoFuture, Poll, Async};
+use hyper::status::StatusCode;
 use futures::stream::Stream;
+use hyper::Client;
+use hyper::header::{Headers, Accept, ContentType, qitem};
 use net2::UdpBuilder;
 use net2::unix::UnixUdpBuilderExt;
 use serde::ser::{Serialize, Serializer};
@@ -140,6 +144,7 @@ impl Stream for Converter {
 
 
 #[derive(PartialEq, Eq, Hash, Copy,Clone)]
+#[derive(Debug)]
 pub enum ProtoType {
     Count,
     Time,
@@ -159,7 +164,7 @@ impl ProtoType {
     }
 }
 
-#[derive(Hash, Clone, Eq, PartialEq,)]
+#[derive(Debug, Hash, Clone, Eq, PartialEq,)]
 pub struct Index {
     pub metric: String,
     pub tags: BTreeSet<String>,
@@ -242,6 +247,7 @@ impl Proto {
     }
 }
 
+#[derive(Debug)]
 pub struct Point {
     kind: &'static str,
     value: f64,
@@ -259,7 +265,7 @@ impl Serialize for Point {
         serializer.serialize_map_end(state)
     }
 }
-
+#[derive(Debug)]
 pub struct Entry {
     index: Index,
     /// limit to 4 element
@@ -322,11 +328,6 @@ mod bench {
         });
         let len = len as f64 / 1024.0 / 1024.0;
         let _avg = len / (count as f64);
-        // println!("len is :{}, count: {}, avg: {} ",
-        //          len ,
-        //          count,
-        //          avg,
-        // );
     }
 }
 
@@ -547,15 +548,25 @@ pub struct MetricSet {
     gauge: Arc<Mutex<GaugeSet>>,
     count: Arc<Mutex<CountSet>>,
     queue: Arc<MsQueue<Proto>>,
+    remote: String,
+    client: Client,
+    headers: Headers,
 }
 
 impl MetricSet {
-    fn new(queue: Arc<MsQueue<Proto>>) -> MetricSet {
+
+    fn new(remote: String, queue: Arc<MsQueue<Proto>>) -> MetricSet {
+        let mut headers = Headers::new();
+        headers.set(ContentType("application/json".parse().unwrap()));
+        headers.set(Accept(vec![qitem("application/json".parse().unwrap())]));
         MetricSet {
             time: Arc::new(Mutex::new(TimeSet::default())),
             gauge: Arc::new(Mutex::new(GaugeSet::default())),
             count: Arc::new(Mutex::new(CountSet::default())),
             queue: queue,
+            remote: remote,
+            client: Client::default(),
+            headers: headers,
         }
     }
 
@@ -627,8 +638,32 @@ impl Future for MetricSet {
                 continue;
             }
             info!("Flush ticked");
-            // TODO: impl it
             // json and send back to remote
+            let buf = match serde_json::to_vec(&entries) {
+                Ok(buf) => buf,
+                Err(err) => {
+                    error!("error while encode json {:?}", err);
+                    debug!("encode json={:?} error={:?}", &entries, err);
+                    continue;
+                }
+            };
+
+            let request = self.client.put(&self.remote);
+            let request = request.headers(self.headers.clone());
+            let request = request.body(&buf[..]);
+            match request.send() {
+                Ok(mut resp) => {
+                    if resp.status != StatusCode::Ok {
+                        let mut body = String::new();
+                        resp.read_to_string(&mut body).unwrap();
+                        warn!("send put request error, body: {:?}", body);
+                    }
+                }
+                Err(err) => {
+                    error!("send put request error: {:?}", err);
+                    continue;
+                }
+            };
         }
 
         for jh in jhs {
@@ -696,21 +731,35 @@ unsafe impl Sync for HashRing {}
 pub fn run(bind: &str) {
     env_logger::init().unwrap();
     let ring = Arc::new(HashRing::default());
+    let remote = "http://localhost:8170".to_string();
     let consumers: Vec<_> = ring.ring_queues()
         .iter()
         .map(|queue| {
             let queue = queue.clone();
+            let remote = remote.clone();
             thread::spawn(move || {
-                let mut set = MetricSet::new(queue);
+                let mut set = MetricSet::new(remote, queue);
                 set.poll().unwrap()
             })
         })
         .collect();
 
-    info!("start to produce");
-    run_producer(bind, ring.clone());
-    for con in consumers.into_iter() {
+    let count = com::max(num_cpus::get() / 4, 1);
+    info!("start {} produce thread", count);
+    let producer: Vec<_> = (0..count)
+        .into_iter()
+        .map(|_| {
+            let bind = bind.to_owned();
+            let ring = ring.clone();
+            thread::spawn(move || {
+                run_producer(&bind, ring);
+            })
+        })
+        .collect();
+
+    for (con, pro) in consumers.into_iter().zip(producer.into_iter()) {
         con.join().unwrap();
+        pro.join().unwrap();
     }
 }
 
