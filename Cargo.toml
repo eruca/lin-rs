@@ -4,8 +4,8 @@ version = "0.1.0"
 authors = ["wayslog <wayslog@163.com>"]
 
 [[bin]]
-name="proxy"
-path="src/bin/proxy.rs"
+name="compute"
+path="src/bin/compute.rs"
 
 [lib]
 name="lin"
