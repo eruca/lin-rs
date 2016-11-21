@@ -29,6 +29,7 @@ impl Collector {
             .expect("REUSE_PORT not support in this os")
             .bind(addr)
             .expect("Bind Error");
+
         let socket = UdpSocket::from_socket(std_socket, handle).unwrap();
         let mut vec = Vec::new();
         vec.resize(MAX_LINE_LEN, 0);

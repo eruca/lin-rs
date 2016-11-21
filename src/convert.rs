@@ -62,9 +62,10 @@ pub enum ProtoType {
     Count,
     Time,
     Gauge,
+    Delta,
 }
 
-pub use self::ProtoType::{Count, Time, Gauge};
+pub use self::ProtoType::*;
 
 impl ProtoType {
     fn from_raw(c: char) -> Result<ProtoType> {
@@ -72,6 +73,7 @@ impl ProtoType {
             'c' => Ok(Count),
             't' => Ok(Time),
             'g' => Ok(Gauge),
+            'd' => Ok(Delta),
             _ => Err(LinError::WrongLine),
         }
     }

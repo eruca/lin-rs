@@ -1,5 +1,7 @@
+#![feature(more_struct_aliases)]
 #![feature(test)]
 #![feature(proc_macro)]
+
 #[macro_use]
 extern crate serde_derive;
 #[macro_use]
@@ -39,7 +41,7 @@ use futures::Future;
 use futures::stream::Stream;
 
 pub use net::Collector;
-pub use convert::{Converter, Proto, Index, Gauge, Count, Time};
+pub use convert::{Converter, Proto, Index, Gauge, Count, Time, Delta};
 pub use lin::{Point, Entry};
 pub use memset::MetricSet;
 pub use hash::HashRing;

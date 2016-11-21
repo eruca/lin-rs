@@ -1,4 +1,3 @@
-
 use serde::ser::{Serialize, Serializer};
 
 use ::Index;

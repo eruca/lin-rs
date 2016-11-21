@@ -15,7 +15,7 @@ use serde_json;
 
 
 use ::{Proto, Entry, LinError, com, Index, Point};
-use ::{Count, Time, Gauge};
+use ::{Count, Time, Gauge, Delta};
 
 pub const THRESHOLD: usize = 90;
 pub const THRESHOLD_STR: &'static str = "upper=true";
@@ -133,6 +133,19 @@ pub struct GaugeSet {
 impl Default for GaugeSet {
     fn default() -> Self {
         GaugeSet { inmap: HashMap::new() }
+    }
+}
+
+pub trait DeltaSet: Push {
+    fn delta(&mut self, proto: Proto);
+}
+
+impl DeltaSet for GaugeSet {
+    fn delta(&mut self, proto: Proto) {
+        let value = proto.value;
+        *self.inmap
+            .entry(proto.index)
+            .or_insert(0.0) += value;
     }
 }
 
@@ -255,6 +268,10 @@ impl MetricSet {
                         let mut gauge = gauge.lock().unwrap();
                         gauge.push(proto);
                     }
+                    Delta => {
+                        let mut gauge = gauge.lock().unwrap();
+                        gauge.delta(proto);
+                    }
                 };
             }
         })
@@ -334,25 +351,5 @@ impl Future for MetricSet {
             jh.join().unwrap();
         }
         Ok(Async::NotReady)
-    }
-}
-
-
-impl Push for MetricSet {
-    fn push(&mut self, proto: Proto) {
-        match proto.index.ptype {
-            Count => {
-                let mut lock = self.count.lock().unwrap();
-                lock.push(proto);
-            }
-            Time => {
-                let mut lock = self.time.lock().unwrap();
-                lock.push(proto);
-            }
-            Gauge => {
-                let mut lock = self.gauge.lock().unwrap();
-                lock.push(proto);
-            }
-        }
     }
 }
