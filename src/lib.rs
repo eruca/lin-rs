@@ -14,6 +14,7 @@ extern crate futures;
 extern crate futures_cpupool as pool;
 #[macro_use]
 extern crate hyper;
+extern crate itertools;
 extern crate num_cpus;
 extern crate serde;
 extern crate serde_json;
@@ -39,6 +40,7 @@ use std::default::Default;
 use core::reactor::Core;
 use futures::Future;
 use futures::stream::Stream;
+
 
 pub use net::Collector;
 pub use convert::{Converter, Proto, Index, Gauge, Count, Time, Delta};

@@ -13,6 +13,7 @@ path="src/lib.rs"
 
 [dependencies]
 log="*"
+itertools = "0.5.6"
 env_logger="*"
 futures = "0.1"
 tokio-core = "0.1"

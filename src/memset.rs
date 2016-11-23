@@ -10,16 +10,18 @@ use futures::{Future, Poll, Async};
 use hyper::status::StatusCode;
 use hyper::Client;
 use hyper::header::{Headers, Accept, ContentType, qitem};
+use itertools::Itertools;
 use num_cpus;
 use serde_json;
-
 
 use ::{Proto, Entry, LinError, com, Index, Point};
 use ::{Count, Time, Gauge, Delta};
 
 pub const THRESHOLD: usize = 90;
-pub const THRESHOLD_STR: &'static str = "upper=true";
+pub const THRESHOLD_STR: &'static str = "_threshold=90";
+pub const TOTAL_STR: &'static str = "_threshold=100";
 pub const TOTAL: usize = 100;
+pub const CHUNK_SIZE: usize = 16;
 
 pub trait Truncate {
     fn truncate(&mut self) -> Self;
@@ -68,7 +70,7 @@ impl IntoEntries for TimeSet {
         self.inmap
             .into_iter()
             .flat_map(|(mut idx, list)| {
-                idx.tags.insert("kind=time".to_string());
+                idx.tags.insert("_kind=time".to_string());
                 let mut ets = Vec::new();
                 let len = list.len();
                 if len == 0 {
@@ -84,6 +86,7 @@ impl IntoEntries for TimeSet {
                 }
                 let mut low_idx = idx.clone();
                 low_idx.tags.insert(THRESHOLD_STR.to_owned());
+
                 ets.push(Entry {
                     index: low_idx,
                     time: now,
@@ -100,6 +103,8 @@ impl IntoEntries for TimeSet {
                     max = com::max(max, val);
                     min = com::min(min, val);
                 }
+
+                idx.tags.insert(TOTAL_STR.to_owned());
                 ets.push(Entry {
                     index: idx,
                     time: now,
@@ -162,7 +167,7 @@ impl IntoEntries for GaugeSet {
         self.inmap
             .into_iter()
             .map(|(mut idx, val)| {
-                idx.tags.insert("kind=gauge".to_owned());
+                idx.tags.insert("_kind=gauge".to_owned());
                 let pts = vec![
                     Point{ kind: "SUM", value: val},
                     Point{ kind: "MAX", value: val},
@@ -195,7 +200,8 @@ impl IntoEntries for CountSet {
         self.inmap
             .into_iter()
             .map(|(mut idx, val)| {
-                idx.tags.insert("kind=count".to_owned());
+                idx.tags.insert("_kind=count".to_owned());
+                // TODO: How to caculate each time value?
                 let vec = vec![
                     Point{ kind: "SUM", value: val.0},
                     Point{ kind: "COUNT", value: val.1 as f64},
@@ -281,12 +287,15 @@ impl MetricSet {
         let mut time_guard = self.time.lock().unwrap();
         let mut gauge_guard = self.gauge.lock().unwrap();
         let mut count_guard = self.count.lock().unwrap();
+
         let time = time_guard.truncate();
         let gauge = gauge_guard.truncate();
         let count = count_guard.truncate();
+
         mem::drop(time_guard);
         mem::drop(gauge_guard);
         mem::drop(count_guard);
+
         let mut entries = time.into_entries();
         entries.extend(gauge.into_entries().into_iter());
         entries.extend(count.into_entries().into_iter());
@@ -318,33 +327,39 @@ impl Future for MetricSet {
             if entries.len() == 0 {
                 continue;
             }
-            info!("Flush ticked");
-            // json and send back to remote
-            let buf = match serde_json::to_vec(&entries) {
-                Ok(buf) => buf,
-                Err(err) => {
-                    error!("error while encode json {:?}", err);
-                    debug!("encode json={:?} error={:?}", &entries, err);
-                    continue;
-                }
-            };
+            debug!("Flush ticked");
 
-            let request = self.client.put(&self.remote);
-            let request = request.headers(self.headers.clone());
-            let request = request.body(&buf[..]);
-            match request.send() {
-                Ok(mut resp) => {
-                    if resp.status != StatusCode::Ok {
-                        let mut body = String::new();
-                        resp.read_to_string(&mut body).unwrap();
-                        warn!("send put request error, body: {:?}", body);
+            // json and send back to remote
+            // limit too long body to avoid of buffer overflow in lindb
+            for iter in entries.into_iter().chunks(CHUNK_SIZE).into_iter() {
+                let entries: Vec<_> = iter.collect();
+                let buf = match serde_json::to_vec(&entries) {
+                    Ok(buf) => buf,
+                    Err(err) => {
+                        error!("error while encode json {:?}", err);
+                        debug!("encode json={:?} error={:?}", &entries, err);
+                        continue;
                     }
-                }
-                Err(err) => {
-                    error!("send put request error: {:?}", err);
-                    continue;
-                }
-            };
+                };
+                let request = self.client.put(&self.remote);
+                let request = request.headers(self.headers.clone());
+                let request = request.body(&buf[..]);
+                match request.send() {
+                    Ok(mut resp) => {
+                        if resp.status != StatusCode::Ok {
+                            let mut body = String::new();
+                            resp.read_to_string(&mut body).unwrap();
+                            warn!("send put request error, body: {:?}", body);
+                        }
+                    }
+                    Err(err) => {
+                        error!("send put request error: {:?}", err);
+                        continue;
+                    }
+                };
+
+            }
+
         }
 
         for jh in jhs {
