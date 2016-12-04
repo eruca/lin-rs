@@ -23,11 +23,11 @@ pub fn now() -> u64 {
 }
 
 /// compare and return the max one
-pub fn max<T: PartialOrd + Copy>(lhs: T, rhs: T) -> T {
+pub fn max<T: Ord + Copy>(lhs: T, rhs: T) -> T {
     if lhs > rhs { lhs } else { rhs }
 }
 
 /// compare and return the min one
-pub fn min<T: PartialOrd + Copy>(lhs: T, rhs: T) -> T {
+pub fn min<T: Ord + Copy>(lhs: T, rhs: T) -> T {
     if lhs < rhs { lhs } else { rhs }
 }
